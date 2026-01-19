@@ -4,11 +4,11 @@ Natural language ticker selection + side-by-side comparison
 """
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
+import pandas_ta as ta
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score
 import json
 import os
@@ -26,19 +26,8 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
-# TensorFlow import (optional)
-try:
-    from tensorflow import keras
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.optimizers import Adam
-    LSTM_AVAILABLE = True
-except:
-    LSTM_AVAILABLE = False
-
 # === CONFIGURATION ===
 MIN_REVERSE_PERCENT = 0.02
-SEQUENCE_LENGTH = 10
 RSI_OVERSOLD = 30
 VOLUME_MULTIPLIER = 1.5
 DEFAULT_PREDICTION_DAYS = 5
@@ -52,7 +41,7 @@ def load_gemini_settings():
         try:
             with open(SETTINGS_FILE, 'r') as f:
                 return json.load(f)
-        except:
+        except (OSError, json.JSONDecodeError):
             pass
     return {"api_key": "", "enabled": True}
 
@@ -62,7 +51,7 @@ def save_gemini_settings(settings):
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=2)
         return True
-    except:
+    except OSError:
         return False
 
 
@@ -149,7 +138,7 @@ Response:"""
         return False, [], f"Gemini API error: {error_msg}"
 
 
-def fetch_financial_data(ticker, progress_callback=None):
+def fetch_financial_data(ticker):
     """Fetch quarterly financial statement data"""
     try:
         stock = yf.Ticker(ticker)
@@ -201,8 +190,45 @@ def fetch_financial_data(ticker, progress_callback=None):
 
         return financial_df
 
-    except:
+    except Exception:
         return pd.DataFrame()
+
+
+def evaluate_model_performance(model, X, y):
+    """Evaluate model with time series split and return average metrics."""
+    if len(X) < 30:
+        return None
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    scores = []
+
+    for train_idx, test_idx in tscv.split(X):
+        model.fit(X[train_idx], y[train_idx])
+        preds = model.predict(X[test_idx])
+        scores.append(accuracy_score(y[test_idx], preds) * 100)
+
+    return float(np.mean(scores)) if scores else None
+
+
+def evaluate_regression_performance(model, X, y):
+    """Evaluate regression model with time series split and return avg MAE/R2."""
+    if len(X) < 30:
+        return None, None
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    maes = []
+    r2s = []
+
+    for train_idx, test_idx in tscv.split(X):
+        model.fit(X[train_idx], y[train_idx])
+        preds = model.predict(X[test_idx])
+        maes.append(mean_absolute_error(y[test_idx], preds))
+        r2s.append(r2_score(y[test_idx], preds))
+
+    if not maes:
+        return None, None
+
+    return float(np.mean(maes)), float(np.mean(r2s))
 
 
 def analyze_single_stock(ticker, start_date, end_date, selected_features, prediction_days, progress_callback=None):
@@ -240,7 +266,7 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
             data = data.drop(columns=['Adj Close'])
 
         # Get financial data
-        financial_df = fetch_financial_data(ticker, progress_callback)
+        financial_df = fetch_financial_data(ticker)
         if not financial_df.empty:
             data = data.join(financial_df, how='left')
             data = data.ffill()
@@ -252,7 +278,7 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
 
         try:
             data.ta.rsi(append=True, length=14, close=data['Close'])
-        except:
+        except Exception:
             delta = data['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -261,13 +287,15 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
 
         try:
             data.ta.macd(append=True, close=data['Close'])
-        except:
-            pass
+        except Exception:
+            if progress_callback:
+                progress_callback(f"MACD 계산 실패: {ticker}")
 
         try:
             data.ta.stoch(append=True, high=data['High'], low=data['Low'], close=data['Close'])
-        except:
-            pass
+        except Exception:
+            if progress_callback:
+                progress_callback(f"Stochastic 계산 실패: {ticker}")
 
         data['VMA_20'] = data['Volume'].rolling(window=20).mean()
         data['Price_Change'] = data['Close'].pct_change()
@@ -347,8 +375,6 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
         X_all = train_data[all_features].values
         y_direction = train_data['Target_Direction'].values
         y_return = train_data['Target_Return'].values
-        latest_features = data[all_features].iloc[-prediction_days:].values
-
         # Classification model
         clf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
         clf_model.fit(X_all, y_direction)
@@ -362,15 +388,26 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
         direction_proba = clf_model.predict_proba(latest_prediction_features.values.reshape(1, -1))[0][1] * 100
         expected_return = reg_model.predict(latest_prediction_features.values.reshape(1, -1))[0]
 
-        # Model performance on TRAIN data
-        y_pred_direction = clf_model.predict(X_all)
-        y_pred_return = reg_model.predict(X_all)
-        clf_accuracy = accuracy_score(y_direction, y_pred_direction) * 100
-        reg_mae = mean_absolute_error(y_return, y_pred_return)
-        reg_r2 = r2_score(y_return, y_pred_return)
+        # Model performance with time series split
+        clf_accuracy = evaluate_model_performance(
+            RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1),
+            X_all,
+            y_direction
+        )
+        reg_mae, reg_r2 = evaluate_regression_performance(
+            RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1),
+            X_all,
+            y_return
+        )
+        if clf_accuracy is None:
+            clf_accuracy = accuracy_score(y_direction, clf_model.predict(X_all)) * 100
+        if reg_mae is None or reg_r2 is None:
+            y_pred_return = reg_model.predict(X_all)
+            reg_mae = mean_absolute_error(y_return, y_pred_return)
+            reg_r2 = r2_score(y_return, y_pred_return)
 
         # Store prediction results for visualization
-        train_data['Predicted_Direction'] = y_pred_direction
+        train_data['Predicted_Direction'] = clf_model.predict(X_all)
         train_data['Prediction_Match'] = np.where(train_data['Predicted_Direction'] == train_data['Target_Direction'], 1, 0)
 
         # Get current price and financial metrics
@@ -405,7 +442,7 @@ def analyze_single_stock(ticker, start_date, end_date, selected_features, predic
             'train_data_for_plot': train_data.tail(200)
         }
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -525,6 +562,10 @@ def main():
     # Initialize session state
     if 'gemini_settings' not in st.session_state:
         st.session_state.gemini_settings = load_gemini_settings()
+        secret_key = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
+        env_key = os.getenv("GEMINI_API_KEY")
+        if not st.session_state.gemini_settings.get("api_key"):
+            st.session_state.gemini_settings["api_key"] = secret_key or env_key or ""
     if 'tickers' not in st.session_state:
         st.session_state.tickers = 'AAPL, MSFT, GOOGL'
 
@@ -543,6 +584,8 @@ def main():
             type="password",
             help="Get your free API key from Google AI Studio"
         )
+
+        st.caption("보안 권장: GEMINI_API_KEY 환경 변수 또는 Streamlit secrets 사용을 권장합니다.")
 
         if st.button("💾 Save API Key"):
             st.session_state.gemini_settings['api_key'] = api_key
@@ -806,7 +849,7 @@ def display_results(results, prediction_days):
         st.markdown(f"""
         - **Expected Return**: Predicted return over the next {prediction_days} days
         - **Direction Probability**: Chance of a {prediction_days}-day increase of 2%+
-        - **Accuracy**: Model accuracy on training data (for visualization)
+        - **Accuracy**: Time-series split 평균 정확도 (데이터 부족 시 훈련 성능)
         - **R²**: Regression model fit quality (higher is better, max 1.0)
         - **Active Signals**: Technical indicators that are currently triggered
         """)
